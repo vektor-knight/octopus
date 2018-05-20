@@ -1,0 +1,256 @@
+import concurrent.futures
+import MySQLdb
+import os.path
+import subprocess
+import torndb
+import tornado.escape
+import tornado.httpserver
+import tornado.ioloop
+import tornado.options
+import tornado.web
+from bs4 import BeautifulSoup
+import hashlib
+import urllib
+import re
+import operator
+import math
+import nltk
+from tornado.options import define, options
+
+nltk.download('stopwords')
+
+from nltk.corpus import stopwords
+#from wit import Wit
+
+stopwords_set = set(stopwords.words('english'))
+SALT = 'testsalt'
+
+
+def remove_html_tags(text):
+    """
+        Removes all the html tags, scripts and styles
+    """
+    # remove not visible content
+    soup = BeautifulSoup(text, 'html.parser')
+    texts = soup.findAll(text=True)
+
+    def visible(element):
+        if element.parent.name in ['style', 'script', '[document]', 'head', 'title']:
+            return False
+        elif re.match('<!--.*-->', str(element.encode('utf-8'))):
+            return False
+        return True
+    visible_texts = filter(visible, texts)
+
+    # remove html tags
+    text = " ".join(visible_texts)
+    return re.sub(r'<[^>]+>',' ',text)
+
+
+def extract_words(text):
+    """
+        Returns a list with the words of the text
+    """
+    return re.compile('\w+').findall(text)
+
+
+def count_words(words):
+    """
+        Receives a list of words and returns a dictionary with the word and its ocurrences in the list
+    """
+
+    worddict = dict()
+    for word in words:
+        word = word.lower()
+        if word not in stopwords_set:
+            count = worddict.get(word, 0)
+            worddict[word] = count + 1
+    return worddict
+
+
+def topwords(worddict):
+    """
+        Returns a list of tuples with the 100 most frequent words
+    """
+    how_many = 100
+    sortedentries = sorted(worddict.items(), key=operator.itemgetter(1))
+    # we take the last 100 entries
+    return sortedentries[-how_many:]
+
+
+def url_wordcount(url):
+    """
+        Receives an url and returns a tuple with the 100 most frequent words
+    """
+
+    f = urllib.urlopen(url)
+    text = f.read()
+    text = remove_html_tags(text)
+    words = extract_words(text)
+    worddict = count_words(words)
+    wordcount = topwords(worddict)
+    return wordcount
+
+
+def build_wordcloud(wordcount):
+    """
+        Receives a list of tuples (word, count) and returns a dictionary of word and category
+        where category is a value from 1 to 10 where 1 means the least frequent and 10 means the most frequent
+    """
+
+    wordcloud = dict()
+    max_count = wordcount[-1][1]
+    for word, count in wordcount:
+        # size goes from 1 to 10 and divides the frequencies in categories
+        size = int(math.ceil(10 * count/max_count))
+        wordcloud[word] = size
+    return wordcloud
+
+
+def hash_word(word):
+    """
+        Computes the salted hash for the word
+    """
+
+    m = hashlib.sha1()
+    m.update(SALT)
+    m.update(word)
+    return m.hexdigest()
+
+
+def add_to_database(db, wordcount):
+    """
+        Adds all the words to the database, with its frequency. If the word doesn't exists, it is inserted
+        with its frequency. If the word already exists (its hash matches with a stored one) then the count
+        is added to the stored frequency and the row is updated.
+    """
+    for word, count in wordcount:
+        id = hash_word(word)
+        obj = db.get("SELECT * FROM wordcount WHERE id = %s", id)
+        if obj is None:
+            # TODO: Mysql does not support assymetric encryption by default. Will add a layer after discussion.
+            db.execute(
+                "INSERT INTO wordcount (id,word,wcount) "
+                "VALUES (%s,%s,%s)",
+                id, word, count)
+        else:
+            db.execute(
+                "UPDATE wordcount "
+                "SET wcount = wcount + %s "
+                "WHERE id = %s",
+                count, id
+            )
+
+
+''' From pywit examples '''
+def first_entity_value(entities, entity):
+    if entity not in entities:
+        return None
+    val = entities[entity][0]['value']
+    if not val:
+        return None
+    return val['value'] if isinstance(val, dict) else val
+
+def handle_message(response):
+    entities = response['entities']
+    sentiment = first_entity_value(entities, 'sentiment')
+    if sentiment:
+        return 'The sentiment was good' if sentiment == 'positive' else 'Bad'
+
+class BaseHandler(tornado.web.RequestHandler):
+    @property
+    def db(self):
+        return self.application.db
+
+
+class MainHandler(BaseHandler):
+    def get(self):
+        wordcloud = {}
+        error = None
+        url = self.get_argument("url", None)
+        if url is not None:
+            try:
+                wordcount = url_wordcount(url)
+		# The bottom three lines represent the main algo for
+                # sentiment analysis. This is where I stopped debugging.
+                #Get the sentiment of the words from wordcount
+		#word_list = [x[0] for x in wordcount] # get the words
+                #for word in word_list:
+                #   handle_message(word[0]) ## Point of failure in API comms with WIT.AI
+
+                add_to_database(self.db, wordcount)
+                wordcloud = build_wordcloud(wordcount)
+            except IOError:
+                error = "Url can't be reached."
+
+        self.render("main.html", url=url, wordcloud=wordcloud, error=error)
+
+
+class AdminHandler(BaseHandler):
+    def get(self):
+        counts = self.db.query("SELECT * FROM wordcount ORDER BY wcount "
+                                "DESC")
+        self.render("admin.html", counts=counts)
+
+
+define("port", default=8888, help="run on the given port", type=int)
+define("mysql_host", default="db:3306", help="database host")
+define("mysql_database", default="octopus", help="octopus database name")
+define("mysql_user", default="octopus", help="octopus database user")
+define("mysql_password", default="octopus", help="octopus database password")
+
+
+# A thread pool to be used for password hashing with bcrypt.
+executor = concurrent.futures.ThreadPoolExecutor(2)
+
+
+class Application(tornado.web.Application):
+    def __init__(self):
+        handlers = [
+            (r"/", MainHandler),
+            (r"/admin", AdminHandler)
+        ]
+        settings = dict(
+            page_title=u"Octopus Word Count",
+            template_path=os.path.join(os.path.dirname(__file__), "templates"),
+            static_path=os.path.join(os.path.dirname(__file__), "static"),
+            xsrf_cookies=True,
+            #cookie_secret="__TODO:_GENERATE_YOUR_OWN_RANDOM_VALUE_HERE__",
+            #login_url="/auth/login",
+            #debug=True,
+        )
+        super(Application, self).__init__(handlers, **settings)
+        # Have one global connection to the blog DB across all handlers
+#        Con = MySQLdb.Connect(host="octopus", port=3306, user="octopus", passwd="octopus", db="octopus")
+        self.db = torndb.Connection(
+            host=options.mysql_host, database=options.mysql_database,
+            user=options.mysql_user, password=options.mysql_password)
+
+        self.maybe_create_tables()
+
+    def maybe_create_tables(self):
+        try:
+            self.db.get("SELECT COUNT(*) from wordcount;")
+        except MySQLdb.ProgrammingError:
+            subprocess.check_call(['mysql',
+                                   '--host=' + options.mysql_host,
+                                   '--database=' + options.mysql_database,
+                                   '--user=' + options.mysql_user,
+                                   '--password=' + options.mysql_password],
+                                  stdin=open('schema.sql'))
+
+
+def main():
+    tornado.options.parse_command_line()
+    http_server = tornado.httpserver.HTTPServer(Application())
+    http_server.listen(options.port)
+    tornado.ioloop.IOLoop.current().start()
+
+
+if __name__ == "__main__":
+    main()
+
+
+client = Wit(access_token='DC6A45UMBAFOI77XU2SCZ7PS5IQUDTHB')
+client.interactive(handle_message=handle_message)
+

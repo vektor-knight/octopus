@@ -1,0 +1,27 @@
+version: '3.6'
+
+services:
+  python:
+    build: .
+    depends_on:
+      - db
+    restart: always
+    environment:
+      DB_HOST: db
+      DB_USER: octopus
+      DB_PASSWORD: octopus 
+    ports:
+      - "8888:8888"
+
+  db:
+    image: mysql:5.7
+    volumes:
+      - ./docker-entrypoint-initdb.d/:/docker-entrypoint-initdb.d/
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: octopus
+      MYSQL_USER: octopus
+      MYSQL_PASSWORD: octopus
+    
+

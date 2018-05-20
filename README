@@ -1,0 +1,13 @@
+To execute:
+
+$ docker-compose up
+
+Tested on an Ubuntu amd_x64 Linux host
+
+60-second timer used to wait for MySQL to initialize.
+
+Once the Python container says that the timeout has
+occurred on standard output (terminal), you can go to:
+
+localhost:8888
+
